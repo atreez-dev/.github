@@ -11,9 +11,7 @@
 #       with:
 #         prod_host: 34.64.58.204
 #         deploy_path: /opt/docker/apps/myapp
-#       secrets:
-#         ssh_key: ${{ secrets.PROD_SSH_KEY }}
-#         registry_token: ${{ secrets.GITHUB_TOKEN }}
+#       secrets: inherit
 # ==============================================================================
 
 name: Reusable Docker Build & Deploy
@@ -94,9 +92,6 @@ on:
       build_secrets:
         description: 'Build-time secrets as multiline KEY=VALUE for Docker build args'
         required: false
-      registry_token:
-        description: 'Token for GHCR login on remote server (pass secrets.GITHUB_TOKEN)'
-        required: true
 
     outputs:
       image_tag:
@@ -200,7 +195,7 @@ jobs:
 
       - name: Send registry token to server
         run: |
-          echo "${{ secrets.registry_token }}" > /tmp/ghcr_token
+          echo "${{ secrets.GITHUB_TOKEN }}" > /tmp/ghcr_token
           scp -o StrictHostKeyChecking=accept-new \
               -i ~/.ssh/deploy_key \
               /tmp/ghcr_token \
