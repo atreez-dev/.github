@@ -171,8 +171,9 @@ jobs:
             ${{ steps.meta.outputs.full }}:${{ steps.meta.outputs.tag }}
             ${{ steps.meta.outputs.full }}:latest
           build-args: ${{ steps.build_args.outputs.flags_multiline }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Use local Docker layer cache on self-hosted runner (GHA cache has reliability issues)
+          cache-from: type=registry,ref=${{ steps.meta.outputs.full }}:buildcache
+          cache-to: type=registry,ref=${{ steps.meta.outputs.full }}:buildcache,mode=max,ignore-error=true
 
   # ============================================================================
   # Job 2: Deploy to Target Server
