@@ -13,17 +13,7 @@
 #         deploy_path: /opt/docker/apps/myapp
 #       secrets:
 #         ssh_key: ${{ secrets.PROD_SSH_KEY }}
-#
-# Usage (with environment):
-#   jobs:
-#     deploy:
-#       uses: atreez-dev/.github/.github/workflows/reusable-docker-deploy.yml@main
-#       with:
-#         environment: staging
-#         prod_host: 10.0.0.50
-#         deploy_path: /opt/docker/apps/myapp
-#       secrets:
-#         ssh_key: ${{ secrets.STAGE_SSH_KEY }}
+#         registry_token: ${{ secrets.GITHUB_TOKEN }}
 # ==============================================================================
 
 name: Reusable Docker Build & Deploy
@@ -33,13 +23,13 @@ on:
     inputs:
       # ── Environment ──
       environment:
-        description: 'Deployment environment (staging, production). Used for GitHub Environment Protection Rules.'
+        description: 'Deployment environment (staging, production)'
         type: string
         default: 'production'
 
       # ── Build Configuration ──
       dockerfile:
-        description: 'Path to Dockerfile (relative to repo root)'
+        description: 'Path to Dockerfile'
         type: string
         default: 'Dockerfile'
       build_context:
@@ -47,7 +37,7 @@ on:
         type: string
         default: '.'
       build_args:
-        description: 'Docker build args as multiline KEY=VALUE (secrets injected separately)'
+        description: 'Non-secret build args as multiline KEY=VALUE'
         type: string
         default: ''
 
@@ -75,7 +65,7 @@ on:
         type: string
         default: '/api/health'
       health_check_port:
-        description: 'Application port for health check'
+        description: 'Application port'
         type: string
         default: '3555'
       health_check_timeout:
@@ -93,7 +83,7 @@ on:
         type: boolean
         default: false
       runner_labels:
-        description: 'Runner label — use "ubuntu-latest" for GitHub hosted, or "self-hosted,docker-builder" for self-hosted'
+        description: '"ubuntu-latest" (default) or "self-hosted,docker-builder"'
         type: string
         default: 'ubuntu-latest'
 
@@ -104,13 +94,16 @@ on:
       build_secrets:
         description: 'Build-time secrets as multiline KEY=VALUE for Docker build args'
         required: false
+      registry_token:
+        description: 'Token for GHCR login on remote server (pass secrets.GITHUB_TOKEN)'
+        required: true
 
     outputs:
       image_tag:
         description: 'Short commit SHA used as image tag'
         value: ${{ jobs.build.outputs.image_tag }}
       image_full:
-        description: 'Full image URI (ghcr.io/org/repo:tag)'
+        description: 'Full image URI without tag (ghcr.io/org/repo)'
         value: ${{ jobs.build.outputs.image_full }}
 
 env:
@@ -123,6 +116,7 @@ jobs:
   # ============================================================================
   build:
     runs-on: ${{ inputs.runner_labels }}
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
@@ -147,27 +141,25 @@ jobs:
           echo "Image: ${FULL}:${SHORT_SHA} (env: ${{ inputs.environment }})"
 
       - name: Login to GHCR
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | \
-            docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Prepare build args
         id: build_args
         run: |
           {
             echo "flags_multiline<<BUILDARGS_EOF"
-
             if [ -n "$INPUT_BUILD_ARGS" ]; then
               echo "$INPUT_BUILD_ARGS"
             fi
-
             if [ -n "$BUILD_SECRETS" ]; then
               echo "$BUILD_SECRETS"
             fi
-
             echo "GIT_SHA=${{ steps.meta.outputs.tag }}"
             echo "BUILD_TIME=$(date +%s)"
-
             echo "BUILDARGS_EOF"
           } >> "$GITHUB_OUTPUT"
         env:
@@ -194,6 +186,7 @@ jobs:
     if: ${{ !inputs.skip_deploy }}
     needs: build
     runs-on: ${{ inputs.runner_labels }}
+    timeout-minutes: 15
     environment: ${{ inputs.environment }}
 
     steps:
@@ -202,42 +195,44 @@ jobs:
           mkdir -p ~/.ssh
           echo "${{ secrets.ssh_key }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H "${{ inputs.prod_host }}" >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh-keyscan -H "${{ inputs.prod_host }}" >> ~/.ssh/known_hosts 2>/dev/null || \
+            echo "Warning: ssh-keyscan failed, using accept-new"
+
+      - name: Send registry token to server
+        run: |
+          echo "${{ secrets.registry_token }}" > /tmp/ghcr_token
+          scp -o StrictHostKeyChecking=accept-new \
+              -i ~/.ssh/deploy_key \
+              /tmp/ghcr_token \
+              "${{ inputs.prod_user }}@${{ inputs.prod_host }}":/tmp/ghcr_token
+          rm -f /tmp/ghcr_token
 
       - name: Deploy to ${{ inputs.environment }}
-        env:
-          IMAGE: ${{ needs.build.outputs.image_full }}:${{ needs.build.outputs.image_tag }}
-          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
-          SSH_CMD: ssh -o StrictHostKeyChecking=no -i ~/.ssh/deploy_key ${{ inputs.prod_user }}@${{ inputs.prod_host }}
         run: |
-          echo "Deploying ${IMAGE} to ${{ inputs.prod_host }} (${{ inputs.environment }})..."
+          ssh -o StrictHostKeyChecking=accept-new \
+              -i ~/.ssh/deploy_key \
+              "${{ inputs.prod_user }}@${{ inputs.prod_host }}" \
+              "export IMAGE='${{ needs.build.outputs.image_full }}:${{ needs.build.outputs.image_tag }}' \
+                      IMAGE_TAG='${{ needs.build.outputs.image_tag }}' \
+                      SKIP_MIGRATION='${{ inputs.skip_migration }}' \
+                      HEALTH_CHECK_PORT='${{ inputs.health_check_port }}' \
+                      HEALTH_CHECK_URL='${{ inputs.health_check_url }}' \
+                      HEALTH_CHECK_TIMEOUT='${{ inputs.health_check_timeout }}' \
+                      DEPLOY_PATH='${{ inputs.deploy_path }}' \
+                      DEPLOY_SCRIPT='${{ inputs.deploy_script }}' && \
+               cat /tmp/ghcr_token | docker login ghcr.io -u github --password-stdin && \
+               rm -f /tmp/ghcr_token && \
+               docker pull \"\${IMAGE}\" && \
+               docker tag \"\${IMAGE}\" \"\$(echo \"\${IMAGE}\" | cut -d: -f1):latest\" && \
+               cd \"\${DEPLOY_PATH}\" && \
+               bash \"deploy/\${DEPLOY_SCRIPT}\""
 
-          $SSH_CMD << DEPLOY_SCRIPT
-            set -e
-
-            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u github --password-stdin
-
-            echo "[INFO] Pulling ${IMAGE}..."
-            docker pull ${IMAGE}
-            docker tag ${IMAGE} \$(echo "${IMAGE}" | cut -d: -f1):latest
-
-            cd ${{ inputs.deploy_path }}
-            if [ -f "deploy/${{ inputs.deploy_script }}" ]; then
-              export IMAGE_TAG="${IMAGE_TAG}"
-              export IMAGE_FULL="${IMAGE}"
-              export SKIP_MIGRATION="${{ inputs.skip_migration }}"
-              export HEALTH_CHECK_PORT="${{ inputs.health_check_port }}"
-              export HEALTH_CHECK_URL="${{ inputs.health_check_url }}"
-              export HEALTH_CHECK_TIMEOUT="${{ inputs.health_check_timeout }}"
-              bash "deploy/${{ inputs.deploy_script }}"
-            else
-              echo "[ERROR] Deploy script not found: deploy/${{ inputs.deploy_script }}"
-              exit 1
-            fi
-          DEPLOY_SCRIPT
-
-          echo "Deployment to ${{ inputs.environment }} completed"
-
-      - name: Cleanup SSH
+      - name: Cleanup
         if: always()
-        run: rm -f ~/.ssh/deploy_key
+        run: |
+          # Clean remote token (in case deploy failed before rm)
+          ssh -o StrictHostKeyChecking=accept-new \
+              -i ~/.ssh/deploy_key \
+              "${{ inputs.prod_user }}@${{ inputs.prod_host }}" \
+              "rm -f /tmp/ghcr_token" 2>/dev/null || true
+          rm -f ~/.ssh/deploy_key
