@@ -1,0 +1,243 @@
+# ==============================================================================
+# Reusable Docker Build & Deploy via GHCR
+#
+# Shared workflow for all atreez-dev projects.
+# Supports multi-environment deployment (stage, production, etc.)
+#
+# Usage (minimal):
+#   jobs:
+#     deploy:
+#       uses: atreez-dev/.github/.github/workflows/reusable-docker-deploy.yml@main
+#       with:
+#         prod_host: 34.64.58.204
+#         deploy_path: /opt/docker/apps/myapp
+#       secrets:
+#         ssh_key: ${{ secrets.PROD_SSH_KEY }}
+#
+# Usage (with environment):
+#   jobs:
+#     deploy:
+#       uses: atreez-dev/.github/.github/workflows/reusable-docker-deploy.yml@main
+#       with:
+#         environment: staging
+#         prod_host: 10.0.0.50
+#         deploy_path: /opt/docker/apps/myapp
+#       secrets:
+#         ssh_key: ${{ secrets.STAGE_SSH_KEY }}
+# ==============================================================================
+
+name: Reusable Docker Build & Deploy
+
+on:
+  workflow_call:
+    inputs:
+      # ── Environment ──
+      environment:
+        description: 'Deployment environment (staging, production). Used for GitHub Environment Protection Rules.'
+        type: string
+        default: 'production'
+
+      # ── Build Configuration ──
+      dockerfile:
+        description: 'Path to Dockerfile (relative to repo root)'
+        type: string
+        default: 'Dockerfile'
+      build_context:
+        description: 'Docker build context directory'
+        type: string
+        default: '.'
+      build_args:
+        description: 'Docker build args as multiline KEY=VALUE (secrets injected separately)'
+        type: string
+        default: ''
+
+      # ── Deployment Configuration ──
+      prod_host:
+        description: 'Target server IP or hostname'
+        required: true
+        type: string
+      prod_user:
+        description: 'SSH user on target server'
+        type: string
+        default: 'ubuntu'
+      deploy_path:
+        description: 'Application directory on target server'
+        required: true
+        type: string
+      deploy_script:
+        description: 'Deploy script name (in deploy_path/deploy/)'
+        type: string
+        default: 'deploy-ci.sh'
+
+      # ── Health Check ──
+      health_check_url:
+        description: 'Health check endpoint path'
+        type: string
+        default: '/api/health'
+      health_check_port:
+        description: 'Application port for health check'
+        type: string
+        default: '3555'
+      health_check_timeout:
+        description: 'Health check timeout in seconds'
+        type: string
+        default: '90'
+
+      # ── Options ──
+      skip_migration:
+        description: 'Skip database migrations'
+        type: boolean
+        default: false
+      skip_deploy:
+        description: 'Build and push only, do not deploy'
+        type: boolean
+        default: false
+      runner_labels:
+        description: 'Runner label — use "ubuntu-latest" for GitHub hosted, or "self-hosted,docker-builder" for self-hosted'
+        type: string
+        default: 'ubuntu-latest'
+
+    secrets:
+      ssh_key:
+        description: 'SSH private key for target server'
+        required: true
+      build_secrets:
+        description: 'Build-time secrets as multiline KEY=VALUE for Docker build args'
+        required: false
+
+    outputs:
+      image_tag:
+        description: 'Short commit SHA used as image tag'
+        value: ${{ jobs.build.outputs.image_tag }}
+      image_full:
+        description: 'Full image URI (ghcr.io/org/repo:tag)'
+        value: ${{ jobs.build.outputs.image_full }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ============================================================================
+  # Job 1: Build Docker Image & Push to GHCR
+  # ============================================================================
+  build:
+    runs-on: ${{ inputs.runner_labels }}
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+      image_full: ${{ steps.meta.outputs.full }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set image metadata
+        id: meta
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          FULL="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          echo "tag=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "full=${FULL}" >> "$GITHUB_OUTPUT"
+          echo "Image: ${FULL}:${SHORT_SHA} (env: ${{ inputs.environment }})"
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Prepare build args
+        id: build_args
+        run: |
+          {
+            echo "flags_multiline<<BUILDARGS_EOF"
+
+            if [ -n "$INPUT_BUILD_ARGS" ]; then
+              echo "$INPUT_BUILD_ARGS"
+            fi
+
+            if [ -n "$BUILD_SECRETS" ]; then
+              echo "$BUILD_SECRETS"
+            fi
+
+            echo "GIT_SHA=${{ steps.meta.outputs.tag }}"
+            echo "BUILD_TIME=$(date +%s)"
+
+            echo "BUILDARGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+        env:
+          INPUT_BUILD_ARGS: ${{ inputs.build_args }}
+          BUILD_SECRETS: ${{ secrets.build_secrets }}
+
+      - name: Build & Push to GHCR
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ inputs.build_context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.full }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.full }}:latest
+          build-args: ${{ steps.build_args.outputs.flags_multiline }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ============================================================================
+  # Job 2: Deploy to Target Server
+  # ============================================================================
+  deploy:
+    if: ${{ !inputs.skip_deploy }}
+    needs: build
+    runs-on: ${{ inputs.runner_labels }}
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.ssh_key }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ inputs.prod_host }}" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Deploy to ${{ inputs.environment }}
+        env:
+          IMAGE: ${{ needs.build.outputs.image_full }}:${{ needs.build.outputs.image_tag }}
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          SSH_CMD: ssh -o StrictHostKeyChecking=no -i ~/.ssh/deploy_key ${{ inputs.prod_user }}@${{ inputs.prod_host }}
+        run: |
+          echo "Deploying ${IMAGE} to ${{ inputs.prod_host }} (${{ inputs.environment }})..."
+
+          $SSH_CMD << DEPLOY_SCRIPT
+            set -e
+
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u github --password-stdin
+
+            echo "[INFO] Pulling ${IMAGE}..."
+            docker pull ${IMAGE}
+            docker tag ${IMAGE} \$(echo "${IMAGE}" | cut -d: -f1):latest
+
+            cd ${{ inputs.deploy_path }}
+            if [ -f "deploy/${{ inputs.deploy_script }}" ]; then
+              export IMAGE_TAG="${IMAGE_TAG}"
+              export IMAGE_FULL="${IMAGE}"
+              export SKIP_MIGRATION="${{ inputs.skip_migration }}"
+              export HEALTH_CHECK_PORT="${{ inputs.health_check_port }}"
+              export HEALTH_CHECK_URL="${{ inputs.health_check_url }}"
+              export HEALTH_CHECK_TIMEOUT="${{ inputs.health_check_timeout }}"
+              bash "deploy/${{ inputs.deploy_script }}"
+            else
+              echo "[ERROR] Deploy script not found: deploy/${{ inputs.deploy_script }}"
+              exit 1
+            fi
+          DEPLOY_SCRIPT
+
+          echo "Deployment to ${{ inputs.environment }} completed"
+
+      - name: Cleanup SSH
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
