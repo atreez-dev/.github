@@ -209,6 +209,7 @@ jobs:
               -i ~/.ssh/deploy_key \
               "${{ inputs.prod_user }}@${{ inputs.prod_host }}" \
               "export IMAGE='${{ needs.build.outputs.image_full }}:${{ needs.build.outputs.image_tag }}' \
+                      IMAGE_FULL='${{ needs.build.outputs.image_full }}:${{ needs.build.outputs.image_tag }}' \
                       IMAGE_TAG='${{ needs.build.outputs.image_tag }}' \
                       SKIP_MIGRATION='${{ inputs.skip_migration }}' \
                       HEALTH_CHECK_PORT='${{ inputs.health_check_port }}' \
