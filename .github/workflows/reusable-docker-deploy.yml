@@ -217,7 +217,7 @@ jobs:
                       HEALTH_CHECK_TIMEOUT='${{ inputs.health_check_timeout }}' \
                       DEPLOY_PATH='${{ inputs.deploy_path }}' \
                       DEPLOY_SCRIPT='${{ inputs.deploy_script }}' && \
-               cat /tmp/ghcr_token | docker login ghcr.io -u github --password-stdin && \
+               cat /tmp/ghcr_token | sudo docker login ghcr.io -u github --password-stdin && \
                rm -f /tmp/ghcr_token && \
                docker pull \"\${IMAGE}\" && \
                docker tag \"\${IMAGE}\" \"\$(echo \"\${IMAGE}\" | cut -d: -f1):latest\" && \
