@@ -186,6 +186,8 @@ jobs:
     environment: ${{ inputs.environment }}
 
     steps:
+      - uses: actions/checkout@v4
+
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
@@ -194,42 +196,53 @@ jobs:
           ssh-keyscan -H "${{ inputs.prod_host }}" >> ~/.ssh/known_hosts 2>/dev/null || \
             echo "Warning: ssh-keyscan failed, using accept-new"
 
-      - name: Send registry token to server
+      - name: Sync deploy script and token to server
         run: |
+          DEPLOY_SCRIPT="${{ inputs.deploy_script }}"
+          SCP_OPTS="-o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key"
+          TARGET="${{ inputs.prod_user }}@${{ inputs.prod_host }}"
+
+          # Upload latest deploy script from repo
+          if [ -f "deploy/${DEPLOY_SCRIPT}" ]; then
+            scp ${SCP_OPTS} "deploy/${DEPLOY_SCRIPT}" "${TARGET}:/tmp/deploy-ci-script.sh"
+          fi
+
+          # Upload registry token
           echo "${{ secrets.GITHUB_TOKEN }}" > /tmp/ghcr_token
-          scp -o StrictHostKeyChecking=accept-new \
-              -i ~/.ssh/deploy_key \
-              /tmp/ghcr_token \
-              "${{ inputs.prod_user }}@${{ inputs.prod_host }}":/tmp/ghcr_token
+          scp ${SCP_OPTS} /tmp/ghcr_token "${TARGET}":/tmp/ghcr_token
           rm -f /tmp/ghcr_token
 
       - name: Deploy to ${{ inputs.environment }}
         run: |
+          DEPLOY_PATH="${{ inputs.deploy_path }}"
+          DEPLOY_SCRIPT="${{ inputs.deploy_script }}"
           ssh -o StrictHostKeyChecking=accept-new \
               -i ~/.ssh/deploy_key \
               "${{ inputs.prod_user }}@${{ inputs.prod_host }}" \
-              "export IMAGE='${{ needs.build.outputs.image_full }}:${{ needs.build.outputs.image_tag }}' \
+              "if [ -f /tmp/deploy-ci-script.sh ]; then \
+                 sudo cp /tmp/deploy-ci-script.sh ${DEPLOY_PATH}/deploy/${DEPLOY_SCRIPT} && \
+                 sudo chmod +x ${DEPLOY_PATH}/deploy/${DEPLOY_SCRIPT} && \
+                 rm -f /tmp/deploy-ci-script.sh; \
+               fi && \
+               export IMAGE='${{ needs.build.outputs.image_full }}:${{ needs.build.outputs.image_tag }}' \
                       IMAGE_FULL='${{ needs.build.outputs.image_full }}:${{ needs.build.outputs.image_tag }}' \
                       IMAGE_TAG='${{ needs.build.outputs.image_tag }}' \
                       SKIP_MIGRATION='${{ inputs.skip_migration }}' \
                       HEALTH_CHECK_PORT='${{ inputs.health_check_port }}' \
                       HEALTH_CHECK_URL='${{ inputs.health_check_url }}' \
-                      HEALTH_CHECK_TIMEOUT='${{ inputs.health_check_timeout }}' \
-                      DEPLOY_PATH='${{ inputs.deploy_path }}' \
-                      DEPLOY_SCRIPT='${{ inputs.deploy_script }}' && \
+                      HEALTH_CHECK_TIMEOUT='${{ inputs.health_check_timeout }}' && \
                cat /tmp/ghcr_token | sudo docker login ghcr.io -u github --password-stdin && \
                rm -f /tmp/ghcr_token && \
-               docker pull \"\${IMAGE}\" && \
-               docker tag \"\${IMAGE}\" \"\$(echo \"\${IMAGE}\" | cut -d: -f1):latest\" && \
-               cd \"\${DEPLOY_PATH}\" && \
-               bash \"deploy/\${DEPLOY_SCRIPT}\""
+               sudo docker pull \"\${IMAGE}\" && \
+               sudo docker tag \"\${IMAGE}\" \"\$(echo \"\${IMAGE}\" | cut -d: -f1):latest\" && \
+               cd ${DEPLOY_PATH} && \
+               bash deploy/${DEPLOY_SCRIPT}"
 
       - name: Cleanup
         if: always()
         run: |
-          # Clean remote token (in case deploy failed before rm)
           ssh -o StrictHostKeyChecking=accept-new \
               -i ~/.ssh/deploy_key \
               "${{ inputs.prod_user }}@${{ inputs.prod_host }}" \
-              "rm -f /tmp/ghcr_token" 2>/dev/null || true
+              "rm -f /tmp/ghcr_token /tmp/deploy-ci-script.sh" 2>/dev/null || true
           rm -f ~/.ssh/deploy_key
