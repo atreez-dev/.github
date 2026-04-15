@@ -207,6 +207,13 @@ jobs:
             scp ${SCP_OPTS} "deploy/${DEPLOY_SCRIPT}" "${TARGET}:/tmp/deploy-ci-script.sh"
           fi
 
+          # Upload latest docker-compose file(s) if present
+          for compose_file in docker-compose.yml docker-compose.yaml; do
+            if [ -f "deploy/${compose_file}" ]; then
+              scp ${SCP_OPTS} "deploy/${compose_file}" "${TARGET}:/tmp/deploy-compose-${compose_file}"
+            fi
+          done
+
           # Upload registry token
           echo "${{ secrets.GITHUB_TOKEN }}" > /tmp/ghcr_token
           scp ${SCP_OPTS} /tmp/ghcr_token "${TARGET}":/tmp/ghcr_token
@@ -224,6 +231,12 @@ jobs:
                  sudo chmod +x ${DEPLOY_PATH}/deploy/${DEPLOY_SCRIPT} && \
                  rm -f /tmp/deploy-ci-script.sh; \
                fi && \
+               for compose_file in docker-compose.yml docker-compose.yaml; do \
+                 if [ -f /tmp/deploy-compose-\${compose_file} ]; then \
+                   sudo cp /tmp/deploy-compose-\${compose_file} ${DEPLOY_PATH}/deploy/\${compose_file} && \
+                   rm -f /tmp/deploy-compose-\${compose_file}; \
+                 fi; \
+               done && \
                export IMAGE='${{ needs.build.outputs.image_full }}:${{ needs.build.outputs.image_tag }}' \
                       IMAGE_FULL='${{ needs.build.outputs.image_full }}:${{ needs.build.outputs.image_tag }}' \
                       IMAGE_TAG='${{ needs.build.outputs.image_tag }}' \
